@@ -49,9 +49,9 @@ def analyze_company(ticker):
 
 def create_graphs(results):
 
-    metrics = results["Metrics"]
-    valuation = results["Valuation"]
-    industry = results["Industry"]
+    metrics = results["metrics"]
+    valuation = results["valuation"]
+    industry = results["industry"]
 
     # Revenue vs Profit
     plt.figure(figsize=(6,4))

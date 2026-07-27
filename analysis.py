@@ -11,39 +11,59 @@ peer_cache = {}
 def dcfcalc(metrics):
     if metrics.get("Fcf") is None or metrics.get("Revenuegrowth") is None:
         return {"error": "Insufficient data for DCF"}
-    growth = min(metrics["Revenuegrowth"], 0.20)
-    Discountrate=0.1
-    
-    rgrowth=[metrics["Fcf"]]
-    
-    for i in range(1,6):
-        rgrowth.append(rgrowth[i-1]*(1+growth))
-    presentvalue=[]
-    for i in range(1,6):
-        presentvalue.append(rgrowth[i]/((1+Discountrate)**(i)))
-    #finding terminal value
-    tv=(rgrowth[-1]*(1+0.04))/(0.1-0.04)
-    #getting tv into present value
-    pv_terminal=tv/((1+Discountrate)**5)
-    EnterpriseValuenow=sum(presentvalue)+pv_terminal
-    #converting into equity value
-    debt=metrics["Debt"] or 0
-    cash=metrics["Cash"] or 0
-    equityvalue=EnterpriseValuenow-debt+cash
-    #intrinsic value per share
-    shares=metrics["Sharesoutstanding"]
-    if shares is None or shares==0:
-        return {"error: Shares Outstanding are not available"}
-    intrinsicvaluepershare=equityvalue/shares
-    price=metrics["Currentprice"]
-    if price is None or price==0:
+
+    # Use Yahoo Finance's revenue growth estimate
+    growth = metrics.get("Revenuegrowth") or 0.05
+    growth = max(min(growth, 0.25), -0.05)
+
+    riskfree = 0.043
+    marketreturn = 0.10
+
+    beta = metrics.get("Beta") or 1.0
+    Discountrate = riskfree + beta * (marketreturn - riskfree)
+
+    # Make sure discount rate is greater than terminal growth
+    terminal_growth = 0.04
+    if Discountrate <= terminal_growth:
+        Discountrate = terminal_growth + 0.01
+
+    rgrowth = [metrics["Fcf"]]
+
+    for i in range(5):
+        projected_growth = max(growth - i * 0.02, 0.03)
+        rgrowth.append(rgrowth[-1] * (1 + projected_growth))
+
+    presentvalue = []
+    for i in range(1, 6):
+        presentvalue.append(rgrowth[i] / ((1 + Discountrate) ** i))
+
+    tv = (rgrowth[-1] * (1 + terminal_growth)) / (Discountrate - terminal_growth)
+    pv_terminal = tv / ((1 + Discountrate) ** 5)
+
+    EnterpriseValuenow = sum(presentvalue) + pv_terminal
+
+    debt = metrics.get("Debt") or 0
+    cash = metrics.get("Cash") or 0
+
+    equityvalue = EnterpriseValuenow - debt + cash
+
+    shares = metrics.get("Sharesoutstanding")
+    if not shares:
+        return {"error": "Shares Outstanding unavailable"}
+
+    intrinsicvaluepershare = equityvalue / shares
+
+    price = metrics.get("Currentprice")
+    if not price:
         return {"error": "Current Price unavailable"}
-    margin = ((intrinsicvaluepershare-price)/ price) * 100
+
+    margin = ((intrinsicvaluepershare - price) / price) * 100
+
     return {
-    "current_price": metrics["Currentprice"],
-    "intrinsic_value": intrinsicvaluepershare,
-    "margin_of_safety": margin,
-    "valuation": "UNDERVALUED" if intrinsicvaluepershare > metrics["Currentprice"] else "OVERVALUED"
+        "current_price": price,
+        "intrinsic_value": intrinsicvaluepershare,
+        "margin_of_safety": margin,
+        "valuation": "UNDERVALUED" if intrinsicvaluepershare > price else "OVERVALUED"
     }
 
 #---------------------------#
@@ -79,77 +99,189 @@ def riskanalysis(stock):
         status="High risk"
     return {"Zscore":zscore,"Status":status}
 #Piotroski F-score
+def get_value(df, names, column=0, default=0):
+    """
+    Returns the first matching value from a financial statement.
+    Tries multiple possible row names and falls back to partial matches.
+    """
+    # Exact matches
+    for name in names:
+        if name in df.index:
+            try:
+                return df.loc[name].iloc[column]
+            except:
+                pass
+
+    # Partial matches
+    for idx in df.index:
+        for name in names:
+            if name.lower() in str(idx).lower():
+                try:
+                    return df.loc[idx].iloc[column]
+                except:
+                    pass
+
+    return default
+
+
 def Riskanalysis(stock):
-    balance,financials,cashflow=finstatements(stock)
-    net_income = financials.loc["Net Income"].iloc[0]
-    prev_net_income = financials.loc["Net Income"].iloc[1]
-    ocf = cashflow.loc["Operating Cash Flow"].iloc[0]
-    prev_ocf = cashflow.loc["Operating Cash Flow"].iloc[1]
-    assets = balance.loc["Total Assets"].iloc[0]
-    prev_assets = balance.loc["Total Assets"].iloc[1]
-    debt = balance.loc["Long Term Debt"].iloc[0]
-    prev_debt = balance.loc["Long Term Debt"].iloc[1]
-    current_assets = balance.loc["Current Assets"].iloc[0]
-    prev_current_assets = balance.loc["Current Assets"].iloc[1]
-    current_liabilities = balance.loc["Current Liabilities"].iloc[0]
-    prev_current_liabilities = balance.loc["Current Liabilities"].iloc[1]
-    shares = balance.loc["Share Issued"].iloc[0]
-    prev_shares = balance.loc["Share Issued"].iloc[1]
-    gross_profit = financials.loc["Gross Profit"].iloc[0]
-    prev_gross_profit = financials.loc["Gross Profit"].iloc[1]
-    revenue = financials.loc["Total Revenue"].iloc[0]
-    prev_revenue = financials.loc["Total Revenue"].iloc[1]
-    gross_margin = gross_profit / revenue
-    prev_gross_margin = prev_gross_profit / prev_revenue
-    asset_turnover = revenue / assets
-    prev_asset_turnover = prev_revenue / prev_assets
+    balance, financials, cashflow = finstatements(stock)
+
+    # Income Statement
+    net_income = get_value(financials, ["Net Income"])
+    prev_net_income = get_value(financials, ["Net Income"], 1)
+
+    gross_profit = get_value(financials, ["Gross Profit"])
+    prev_gross_profit = get_value(financials, ["Gross Profit"], 1)
+
+    revenue = get_value(financials, ["Total Revenue", "Revenue"])
+    prev_revenue = get_value(financials, ["Total Revenue", "Revenue"], 1)
+
+    # Cash Flow
+    ocf = get_value(
+        cashflow,
+        [
+            "Operating Cash Flow",
+            "Cash Flow From Operating Activities",
+            "Total Cash From Operating Activities"
+        ]
+    )
+
+    prev_ocf = get_value(
+        cashflow,
+        [
+            "Operating Cash Flow",
+            "Cash Flow From Operating Activities",
+            "Total Cash From Operating Activities"
+        ],
+        1
+    )
+
+    # Balance Sheet
+    assets = get_value(balance, ["Total Assets"])
+    prev_assets = get_value(balance, ["Total Assets"], 1)
+
+    debt = get_value(
+        balance,
+        [
+            "Long Term Debt",
+            "Total Debt",
+            "Long Term Borrowings",
+            "Long-Term Debt"
+        ]
+    )
+
+    prev_debt = get_value(
+        balance,
+        [
+            "Long Term Debt",
+            "Total Debt",
+            "Long Term Borrowings",
+            "Long-Term Debt"
+        ],
+        1
+    )
+
+    current_assets = get_value(
+        balance,
+        [
+            "Current Assets",
+            "Total Current Assets"
+        ]
+    )
+
+    prev_current_assets = get_value(
+        balance,
+        [
+            "Current Assets",
+            "Total Current Assets"
+        ],
+        1
+    )
+
+    current_liabilities = get_value(
+        balance,
+        [
+            "Current Liabilities",
+            "Total Current Liabilities"
+        ]
+    )
+
+    prev_current_liabilities = get_value(
+        balance,
+        [
+            "Current Liabilities",
+            "Total Current Liabilities"
+        ],
+        1
+    )
+
+    shares = get_value(
+        balance,
+        [
+            "Share Issued",
+            "Ordinary Shares Number",
+            "Common Stock Shares Outstanding"
+        ]
+    )
+
+    prev_shares = get_value(
+        balance,
+        [
+            "Share Issued",
+            "Ordinary Shares Number",
+            "Common Stock Shares Outstanding"
+        ],
+        1
+    )
+
+    # Avoid divide-by-zero
+    gross_margin = gross_profit / revenue if revenue else 0
+    prev_gross_margin = prev_gross_profit / prev_revenue if prev_revenue else 0
+
+    asset_turnover = revenue / assets if assets else 0
+    prev_asset_turnover = prev_revenue / prev_assets if prev_assets else 0
+
     score = 0
-# 1. Positive Net Income
+
+    # Profitability
     if net_income > 0:
         score += 1
-# 2. Positive Operating Cash Flow
+
     if ocf > 0:
         score += 1
-# 3. ROA Improved
-    if (net_income / assets) > (prev_net_income / prev_assets):
+
+    if net_income > prev_net_income:
         score += 1
-# 4. Operating Cash Flow > Net Income
+
     if ocf > net_income:
         score += 1
-# 5. Long-Term Debt Decreased
+
+    # Leverage/Liquidity
     if debt < prev_debt:
         score += 1
-# 6. Current Ratio Improved
-    current_ratio = current_assets / current_liabilities
-    prev_current_ratio = prev_current_assets / prev_current_liabilities
+
+    current_ratio = current_assets / current_liabilities if current_liabilities else 0
+    prev_current_ratio = (
+        prev_current_assets / prev_current_liabilities
+        if prev_current_liabilities
+        else 0
+    )
+
     if current_ratio > prev_current_ratio:
         score += 1
-# 7. No New Shares Issued
+
     if shares <= prev_shares:
         score += 1
-# 8. Gross Margin Improved
-    gross_margin = gross_profit / revenue
-    prev_gross_margin = prev_gross_profit / prev_revenue    
+
+    # Operating Efficiency
     if gross_margin > prev_gross_margin:
         score += 1
-# 9. Asset Turnover Improved
-    asset_turnover = revenue / assets
-    prev_asset_turnover = prev_revenue / prev_assets
+
     if asset_turnover > prev_asset_turnover:
         score += 1
 
-    if score >= 8:
-        status = "Excellent"
-    elif score >= 6:
-        status = "Strong"
-    elif score >= 3:
-        status = "Average"
-    else:
-        status = "Weak"
-    return {
-        "PiotroskiScore": score,
-        "Status": status
-    }
+    return score
 #------------------#
 def get_peer_info(ticker):
     if ticker in peer_cache:

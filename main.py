@@ -1,12 +1,8 @@
-from report import (
-    analyze_company,
-    create_graphs,
-    report_agent,
-    pdf,
-)
-from utils import client
+from graph import app
+from report import create_graphs, pdf
 
 print("Starting main.py")
+
 
 def main():
     from data import find_company
@@ -21,13 +17,17 @@ def main():
 
     print(f"\nSelected: {ticker}\n")
 
-    results = analyze_company(ticker)
+    result = app.invoke({"ticker": ticker})
 
-    create_graphs(results)
+    create_graphs(result)
 
-    report = report_agent(results, client)
+    pdf(ticker, result["report"])
 
-    pdf(ticker, report)
+    print("\n==============================")
+    print("GROUNDING CHECK")
+    print("==============================")
+    print(result["evaluation"]["discrepancy_check"])
+
 
 if __name__ == "__main__":
     main()
