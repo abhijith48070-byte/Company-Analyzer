@@ -21,7 +21,7 @@ def main():
 
     create_graphs(result)
 
-    pdf(ticker, result["report"])
+    pdf(result)
 
     print("\n==============================")
     print("GROUNDING CHECK")
