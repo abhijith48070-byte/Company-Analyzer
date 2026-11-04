@@ -6,7 +6,14 @@ ERP = 0.05             # equity risk premium
 TERMINAL_G = 0.025
 
 
-def compute_wacc(metrics, rf=RISK_FREE, erp=ERP, pretax_cost_of_debt=None, tax_rate=0.21):
+def compute_wacc(metrics, rf=None, erp=None, pretax_cost_of_debt=None, tax_rate=0.21):
+    from assumptions import get_assumptions
+    asm = get_assumptions()
+    src = {"rf_source": asm["rf_source"], "erp_source": asm["erp_source"], "as_of": asm["as_of"]}
+    if rf is not None: src["rf_source"] = "argument"
+    if erp is not None: src["erp_source"] = "argument"
+    rf = asm["rf"] if rf is None else rf
+    erp = asm["erp"] if erp is None else erp
     raw_beta = metrics.get("Beta") or 1.0
     beta = min(max(0.67 * raw_beta + 0.33, 0.3), 2.5)   # Blume-adjusted: shrinks extreme betas toward 1
     ke = rf + beta * erp
@@ -17,7 +24,7 @@ def compute_wacc(metrics, rf=RISK_FREE, erp=ERP, pretax_cost_of_debt=None, tax_r
     wd = debt / total if total else 0
     wacc = (1 - wd) * ke + wd * kd * (1 - tax_rate)
     return {"cost_of_equity": ke, "cost_of_debt_after_tax": kd * (1 - tax_rate), "beta": beta, "raw_beta": raw_beta,
-            "weight_debt": wd, "weight_equity": 1 - wd, "rf": rf, "erp": erp, "wacc": wacc}
+            "weight_debt": wd, "weight_equity": 1 - wd, "rf": rf, "erp": erp, "wacc": wacc, **src}
 
 
 def project_fcf(fcf0, growth, years=10, terminal_g=TERMINAL_G):
@@ -168,7 +175,7 @@ def sum_of_parts(segments, net_debt, shares):
     return (ev - net_debt) / shares
 
 
-def valuation_suite(metrics, peer_infos=None, rf=RISK_FREE):
+def valuation_suite(metrics, peer_infos=None, rf=None):
     w = compute_wacc(metrics, rf=rf)
     out = {"wacc": w, "reverse_dcf": reverse_dcf(metrics, w["wacc"]),
            "scenarios": scenarios(metrics, w["wacc"])}

@@ -185,3 +185,9 @@ def News(stock):
             "URL": content.get("canonicalUrl", {}).get("url")
         })
     return articles
+
+
+def metrics_for(ticker):
+    """Financial-metrics dict for a ticker symbol (fetches Yahoo info)."""
+    _, info = get_company_info(ticker)
+    return get_financialmetrics(info)

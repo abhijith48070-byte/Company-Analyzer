@@ -75,6 +75,16 @@ def _models():
          "random_forest": RandomForestClassifier(n_estimators=300, min_samples_leaf=3, random_state=0),
          "hist_gradient_boosting": HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, random_state=0)}
     try:
+        import xgboost as xgb
+        m["xgboost"] = xgb.XGBClassifier(n_estimators=200, max_depth=3, learning_rate=0.05, subsample=0.8, eval_metric="logloss", verbosity=0)
+    except Exception:
+        pass
+    try:
+        from catboost import CatBoostClassifier
+        m["catboost"] = CatBoostClassifier(iterations=200, depth=4, learning_rate=0.05, verbose=0, random_seed=0)
+    except Exception:
+        pass
+    try:
         import lightgbm as lgb
         m["lightgbm"] = lgb.LGBMClassifier(n_estimators=200, learning_rate=0.05, num_leaves=7, verbose=-1)
     except Exception:
@@ -82,33 +92,128 @@ def _models():
     return m
 
 
+def _auc_ci(y, p, n=300, seed=0):
+    from sklearn.metrics import roc_auc_score
+    rng, y, p, vals = np.random.default_rng(seed), np.asarray(y), np.asarray(p), []
+    for _ in range(n):
+        i = rng.integers(0, len(y), len(y))
+        if len(set(y[i])) == 2:
+            vals.append(roc_auc_score(y[i], p[i]))
+    return [float(np.percentile(vals, 5)), float(np.percentile(vals, 95))] if len(vals) > 30 else None
+
+
+def _ece(y, p, bins=5):
+    """Expected calibration error with equal-count bins."""
+    y, p = np.asarray(y, float), np.asarray(p, float)
+    edges = np.quantile(p, np.linspace(0, 1, bins + 1))
+    idx = np.clip(np.searchsorted(edges, p, side="right") - 1, 0, bins - 1)
+    return float(sum((idx == b).mean() * abs(y[idx == b].mean() - p[idx == b].mean()) for b in range(bins) if (idx == b).any()))
+
+
 def fit_distress(panel):
-    """Predict material Altman Z'' deterioration next year. Compared against the base-rate baseline."""
+    """Predict material Altman Z'' deterioration next year.
+    >=3 fiscal years: train < validation year < test year. Model SELECTION uses the validation year only;
+    the test year is used once for reporting. <3 years: no selection (logistic fixed in advance), others exploratory."""
     from sklearn.metrics import brier_score_loss, roc_auc_score
-    tr, te = chrono_split(panel)
-    if len(tr) < 30 or len(te) < 10 or tr["y_deteriorate"].nunique() < 2 or tr["y_deteriorate"].sum() < 8:
-        return {"error": f"not enough data or too few deterioration cases (train {len(tr)}, test {len(te)}, "
-                         f"positives in train {int(tr['y_deteriorate'].sum()) if len(tr) else 0}); "
+    years = sorted(panel["year"].unique())
+    if len(years) >= 3:
+        tr, va, te = panel[panel.year < years[-2]], panel[panel.year == years[-2]], panel[panel.year == years[-1]]
+    else:
+        tr, te = chrono_split(panel); va = tr.iloc[:0]
+    pos = int(tr["y_deteriorate"].sum()) if len(tr) else 0
+    if len(tr) < 30 or len(te) < 10 or tr["y_deteriorate"].nunique() < 2 or pos < 8:
+        return {"error": f"not enough data or too few deterioration cases (train {len(tr)}, test {len(te)}, positives in train {pos}); "
                          f"try build_panel(..., drop=0.5) or a larger peer set"}
     X, y, Xt, yt = tr[FEATURES], tr["y_deteriorate"], te[FEATURES], te["y_deteriorate"]
     base = y.mean()
-    res = {"n_train": len(tr), "n_test": len(te), "test_year": int(te["year"].max()), "base_rate_train": float(base),
-           "baseline_brier": float(brier_score_loss(yt, np.full(len(yt), base))), "models": {}}
-    best, best_auc = None, -1
+    res = {"n_train": len(tr), "n_val": len(va), "n_test": len(te), "test_year": int(te["year"].max()),
+           "base_rate_train": float(base), "baseline_brier": float(brier_score_loss(yt, np.full(len(yt), base))), "models": {}}
+    can_select = len(va) >= 10 and va["y_deteriorate"].nunique() == 2
     for name, mdl in _models().items():
         mdl.fit(X, y)
         p = mdl.predict_proba(Xt)[:, 1]
-        auc = float(roc_auc_score(yt, p)) if yt.nunique() == 2 else None
-        res["models"][name] = {"auc": auc, "brier": float(brier_score_loss(yt, p))}
-        if auc is not None and auc > best_auc:
-            best, best_auc = name, auc
-    res["best"] = best
-    if best:
-        final = _models()[best].fit(pd.concat([X, Xt]), pd.concat([y, yt]))  # refit on all history for live use
-        res["model"] = final
+        e = {"auc": float(roc_auc_score(yt, p)) if yt.nunique() == 2 else None, "brier": float(brier_score_loss(yt, p)),
+             "ece": _ece(yt, p), "auc_ci90": _auc_ci(yt, p) if yt.nunique() == 2 else None, "val_auc": None}
+        if can_select:
+            e["val_auc"] = float(roc_auc_score(va["y_deteriorate"], mdl.predict_proba(va[FEATURES])[:, 1]))
+        res["models"][name] = e
+    if can_select:
+        res["best"] = max(res["models"], key=lambda k: res["models"][k]["val_auc"])
+        res["selection"] = f"chosen on validation year {years[-2]} ({len(va)} rows); test year {years[-1]} used only for reporting"
+    else:
+        res["best"] = "logistic"
+        res["selection"] = "no selection: fewer than 3 fiscal years in the panel, so logistic was fixed in advance; other models are exploratory"
+    allx = pd.concat([X, va[FEATURES], Xt]); ally = pd.concat([y, va["y_deteriorate"], yt])
+    res["model"] = _models()[res["best"]].fit(allx, ally)       # refit on all history for live use
     rf = _models()["random_forest"].fit(X, y)
     res["feature_importance"] = dict(sorted(zip(FEATURES, map(float, rf.feature_importances_)), key=lambda kv: -kv[1])[:5])
+    try:
+        import shap  # optional
+        ex = shap.TreeExplainer(rf).shap_values(Xt)
+        sv = ex[1] if isinstance(ex, list) else ex[..., 1]
+        res["shap_mean_abs"] = dict(sorted(zip(FEATURES, map(float, np.abs(sv).mean(0))), key=lambda kv: -kv[1])[:5])
+    except Exception:
+        pass
     return res
+
+
+GROUPS = {"profitability": ["gross_margin", "op_margin", "net_margin", "roa"],
+          "leverage_liquidity": ["leverage", "interest_cov", "current_ratio", "cash_ratio"],
+          "earnings_quality": ["accruals", "asset_turnover"], "growth": ["rev_growth"]}
+
+
+def ablation_distress(panel):
+    """Drop one feature group at a time (logistic, fixed hyper-parameters); report the change in test AUC."""
+    from sklearn.metrics import roc_auc_score
+    tr, te = chrono_split(panel)
+    if len(tr) < 30 or len(te) < 10 or te["y_deteriorate"].nunique() < 2 or tr["y_deteriorate"].nunique() < 2:
+        return {"error": "not enough data"}
+
+    def auc(cols):
+        m = _models()["logistic"].fit(tr[cols], tr["y_deteriorate"])
+        return float(roc_auc_score(te["y_deteriorate"], m.predict_proba(te[cols])[:, 1]))
+    full = auc(FEATURES)
+    out = {"full_auc": full, "drop_group_delta_auc": {}}
+    for g, cols in GROUPS.items():
+        keep = [c for c in FEATURES if c not in cols]
+        out["drop_group_delta_auc"][g] = auc(keep) - full
+    return out
+
+
+def conformal_forecaster(panel, target="y_next_growth", alpha=0.1):
+    """Split-conformal intervals: fit on early years, calibrate residual quantile on the validation year,
+    check coverage on the latest year. Also fits quantile gradient boosting as a comparator."""
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.linear_model import BayesianRidge
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    years = sorted(panel["year"].unique())
+    if len(years) < 3:
+        return {"error": f"need >= 3 fiscal years in the panel for train/calibration/test, have {len(years)}"}
+    tr, ca, te = panel[panel.year < years[-2]], panel[panel.year == years[-2]], panel[panel.year == years[-1]]
+    cols = ["rev_growth", "gross_margin", "op_margin", "roa", "leverage", "asset_turnover"]
+    clip = lambda s: s.clip(s.quantile(0.02), s.quantile(0.98))
+    mdl = make_pipeline(StandardScaler(), BayesianRidge()).fit(tr[cols], clip(tr[target]))
+    res_ = np.abs(ca[target] - mdl.predict(ca[cols]))
+    k = int(np.ceil((len(res_) + 1) * (1 - alpha))) - 1
+    q = float(np.sort(res_)[min(k, len(res_) - 1)])
+    pt = mdl.predict(te[cols])
+    out = {"target": target, "n_train": len(tr), "n_cal": len(ca), "n_test": len(te), "half_width": q,
+           "coverage_conformal": float(np.mean(np.abs(te[target] - pt) <= q)), "nominal": 1 - alpha}
+    lo = GradientBoostingRegressor(loss="quantile", alpha=alpha / 2, n_estimators=150, max_depth=2, random_state=0).fit(tr[cols], clip(tr[target]))
+    hi = GradientBoostingRegressor(loss="quantile", alpha=1 - alpha / 2, n_estimators=150, max_depth=2, random_state=0).fit(tr[cols], clip(tr[target]))
+    out["coverage_quantile_gbm"] = float(np.mean((te[target] >= lo.predict(te[cols])) & (te[target] <= hi.predict(te[cols]))))
+    full = pd.concat([tr, ca])
+    out["model"], out["cols"] = make_pipeline(StandardScaler(), BayesianRidge()).fit(full[cols], clip(full[target])), cols
+    return out
+
+
+def conformal_next(fit, periods):
+    if "model" not in fit or len(periods) < 2:
+        return None
+    x = pd.DataFrame([features(periods[0], periods[1])])[fit["cols"]]
+    m = float(fit["model"].predict(x)[0])
+    return {"mean": m, "low": m - fit["half_width"], "high": m + fit["half_width"]}
 
 
 def predict_distress(fit, periods):
@@ -183,7 +288,7 @@ def earnings_surprise_model(rows):
         return {"error": "history has only one outcome class"}
     mdl = LogisticRegression(max_iter=500).fit(X[:k], y[:k])
     acc = float(mdl.score(X[k:], y[k:]))
-    base_acc = float((y[k:] == int(y[:k].mean() >= 0.5)).mean())
+    base_acc = float(max(y[k:].mean(), 1 - y[k:].mean()))      # stronger of always-beat / always-miss on the test window
     nxt = np.array([[s[-1], s[-4:].mean(), beat[-4:].mean()]])
     return {"n_quarters": len(rows), "n_test": len(y) - k, "accuracy": acc, "baseline_accuracy": base_acc,
             "beats_baseline": acc > base_acc, "p_beat_next": float(mdl.predict_proba(nxt)[0, 1]),

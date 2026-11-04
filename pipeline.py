@@ -17,7 +17,18 @@ def peer_info_map(ticker, sector, max_peers=25):
     return {t: i for t, i in zip(pt, infos) if i}
 
 
-def fetch_periods(t):
+def fetch_periods(t, deep=True):
+    """Prefer SEC XBRL history (many fiscal years) for ML panels; fall back to Yahoo's ~4 years."""
+    if deep:
+        try:
+            import edgar
+            cik = data.get_cik(t)
+            if cik:
+                ps = edgar.periods_from_xbrl(edgar.company_facts(cik))
+                if len(ps) >= 6:
+                    return ps
+        except Exception:
+            pass
     stock, _ = data.get_company_info(t)
     return normalize(data.finstatements(stock), periods=4)
 
@@ -51,6 +62,19 @@ def run_ml(ticker, stock, peer_tickers, target_periods, sector="sector"):
     out["distress_validation"] = {k: v for k, v in d.items() if k != "model"}
     if "model" in d:
         out["distress_probability"] = ml.predict_distress(d, target_periods)
+    out["ablation"] = ml.ablation_distress(panel)
+    cf = ml.conformal_forecaster(panel, "y_next_growth")
+    out["conformal_growth"] = {k: v for k, v in cf.items() if k not in ("model", "cols")}
+    if "model" in cf:
+        out["conformal_growth"]["forecast"] = ml.conformal_next(cf, target_periods)
+    import ml2
+    out["walk_forward"] = ml2.walk_forward_distress(panel)
+    out["cross_company"] = ml2.cross_company(panel)
+    sv = ml2.fit_survival(pbt)
+    out["survival"] = {k: v for k, v in sv.items() if k not in ("model", "cols")}
+    if "model" in sv:
+        out["survival"]["forecast"] = ml2.survival_predict(sv, target_periods)
+    out["change_points"] = ml2.structural_changes(target_periods)
     out["anomaly"] = ml.anomaly_scan(panel, target_periods)
     for key, tgt in (("growth", "y_next_growth"), ("margin", "y_next_opm")):
         f = ml.fit_forecaster(panel, tgt)
@@ -84,7 +108,7 @@ def run_events(stock, filings=None):
     return tl
 
 
-def build_rag(ticker, cik, news=None, max_10k=2, max_10q=1):
+def build_rag(ticker, cik, news=None, max_10k=2, max_10q=1, periods=None, releases=None, transcripts=()):
     """Index recent filings + news. Returns FilingIndex (saved to cache/)."""
     import edgar
     from rag import FilingIndex
@@ -92,6 +116,13 @@ def build_rag(ticker, cik, news=None, max_10k=2, max_10q=1):
     for form, n in (("10-K", max_10k), ("10-Q", max_10q)):
         for f in edgar.list_filings(cik, forms=(form,), limit=n):
             idx.add_filing({"form": f["form"], "date": f["date"], "url": f["url"]}, edgar.get_filing_text(f))
+    if periods:
+        idx.add_statements(periods, ticker)
+    for rel in releases or []:                       # SEC earnings press releases (official outlook language)
+        for c in __import__("rag")._chunks(rel["text"], 900):
+            idx.chunks.append({"text": c, "form": "Earnings release (8-K Ex.99)", "date": rel["date"], "item": "", "section": "", "url": rel["url"], "kind": "release"})
+    for t in transcripts:                            # user-supplied: (title, text, date)
+        idx.add_transcript(*t)
     for n in news or []:
         if n.get("Summary"):
             idx.add_document(n.get("Publisher") or "News", f"{n['Title']}. {n['Summary']}", n.get("Date", ""), n.get("URL", ""))
@@ -126,11 +157,40 @@ def render_extras(res):
         if "error" in dv:
             L.append(f"- Distress model: {dv['error']}")
         elif dv:
-            b = dv.get("best")
-            L.append(f"- **Distress model** best={b}, AUC {dv['models'][b]['auc']:.2f} on {dv['n_test']} test rows (year {dv['test_year']}); "
-                     f"Brier {dv['models'][b]['brier']:.3f} vs baseline {dv['baseline_brier']:.3f}. "
+            b = dv.get("best"); mb = dv["models"][b]
+            ci = mb.get("auc_ci90")
+            L.append(f"- **Distress model** ({b}); {dv['selection']}. Test AUC {mb['auc']:.2f}"
+                     + (f" (90% bootstrap CI {ci[0]:.2f}-{ci[1]:.2f})" if ci else "") + f" on {dv['n_test']} rows (year {dv['test_year']}); "
+                     f"Brier {mb['brier']:.3f} vs baseline {dv['baseline_brier']:.3f}; calibration error {mb['ece']:.3f}. "
                      f"P(material Altman Z'' deterioration next year) = {pc(ml_.get('distress_probability'))}. "
                      f"Top drivers: {', '.join(dv.get('feature_importance', {}))}")
+            ab = ml_.get("ablation") or {}
+            if "full_auc" in ab:
+                L.append("- Ablation (change in test AUC when a feature group is removed): " +
+                         ", ".join(f"{k} {v:+.3f}" for k, v in ab["drop_group_delta_auc"].items()))
+        cg = ml_.get("conformal_growth") or {}
+        if "half_width" in cg:
+            f_ = cg.get("forecast")
+            L.append(f"- **Conformal growth interval:** {pc(f_['mean']) if f_ else 'n/a'} +/- {pc(cg['half_width'])}; coverage on latest year "
+                     f"{pc(cg['coverage_conformal'])} (nominal {pc(cg['nominal'])}), quantile-GBM comparator {pc(cg['coverage_quantile_gbm'])}")
+        elif cg.get("error"):
+            L.append(f"- Conformal intervals: {cg['error']}")
+        wf = ml_.get("walk_forward") or {}
+        L.append("- **Walk-forward distress validation:** " + (wf["error"] if "error" in wf else
+                 f"mean AUC by year-ahead fold {', '.join(f'{k} {v:.2f}' for k, v in wf['mean_auc'].items())} -> {wf['verdict']}"))
+        cc = ml_.get("cross_company") or {}
+        L.append("- **Unseen-company generalisation (grouped CV):** " + (cc["error"] if "error" in cc else
+                 "; ".join(f"{k} AUC {v['auc']:.2f}" + (f" ({v['auc_ci90'][0]:.2f}-{v['auc_ci90'][1]:.2f})" if v.get('auc_ci90') else "") for k, v in cc.items())))
+        sv = ml_.get("survival") or {}
+        if "error" in sv:
+            L.append(f"- Survival analysis: {sv['error']}")
+        else:
+            f_ = sv.get("forecast")
+            L.append(f"- **Time to distress (discrete-time hazard):** grouped-CV AUC {pc(sv['grouped_cv_auc'])}, {sv['n_events']} events; " +
+                     (f"P(enter distress zone) 1y {pc(f_['p_1y'])}, 3y {pc(f_['p_3y'])} ({f_['assumption']})" if f_ else "company already in/near the zone or too little history"))
+        cps = [(k, c) for k, v in (ml_.get("change_points") or {}).items() for c in v.get("change_points", [])]
+        L.append("- **Structural changes (mean-shift, permutation-tested):** " + ("; ".join(f"{k} near {c['at']} ({c['mean_before']:.2f}->{c['mean_after']:.2f}, p={c['p_value']:.3f})" for k, c in cps)
+                 if cps else "none detected (short annual series have low power)"))
         an = ml_.get("anomaly", {})
         if "anomaly_percentile" in an:
             L.append(f"- **Anomaly (Isolation Forest):** more unusual than {an['anomaly_percentile']:.0f}% of {an['n_peers']} peer-years. "

@@ -14,3 +14,10 @@ reports/
 tracker.db
 private_companies.json
 __pycache__/
+.venv/
+__pycache__/
+cache/
+reports/
+*.db
+.env
+req_clean.txt
