@@ -1,4 +1,3 @@
-import yfinance as yf
 import pandas as pd
 import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -10,6 +9,7 @@ def get_company_info(ticker):
     if ticker in stock_cache:
         stock = stock_cache[ticker]
     else:
+        import yfinance as yf
         stock = yf.Ticker(ticker)
         stock_cache[ticker] = stock
 
@@ -46,15 +46,27 @@ def get_financialmetrics(info):
         "Roa":info.get("returnOnAssets"),
         "Sharesoutstanding" : info.get("sharesOutstanding"),
         "Currentprice" :info.get("currentPrice"),
-        "Sector":info.get("sector")
+        "Sector":info.get("sector"),
+        "Industry":info.get("industry"),
+        "OperatingMargin":info.get("operatingMargins"),
+        "DividendRate":info.get("dividendRate"),
+        "BookValue":info.get("bookValue"),
+        "GrossMargin":info.get("grossMargins"),
+        "Summary":info.get("longBusinessSummary"),
+        "Employees":info.get("fullTimeEmployees"),
+        "Website":info.get("website"),
     }
     
 #----------------------#
 
 #-----Mapping to s&p 500-----#
 
+def get_cik(ticker):
+    row = SP500[SP500["Symbol"].str.upper() == ticker.upper()]
+    return int(row.iloc[0]["CIK"]) if not row.empty else None
+
+
 def peertickers(sector):
-    import pandas as pd
     sp500 = SP500
     sector_map = {
         "Technology": "Information Technology",
@@ -73,12 +85,18 @@ def peertickers(sector):
 
 
 #---------------------------#
-from rapidfuzz import process
-import pandas as pd
-import os
+try:
+    from rapidfuzz import process
+except ImportError:  # fallback keeps search working without rapidfuzz
+    import difflib
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SP500 = pd.read_csv(os.path.join(BASE_DIR, "sp500.csv"))
+    class process:  # minimal shim
+        @staticmethod
+        def extract(q, choices, limit=5, score_cutoff=0):
+            out = [(c, difflib.SequenceMatcher(None, q.lower(), c.lower()).ratio() * 100, i)
+                   for i, c in enumerate(choices)]
+            out = [o for o in out if o[1] >= score_cutoff]
+            return sorted(out, key=lambda x: -x[1])[:limit]
 
 # Search both company names and tickers
 SEARCH_CHOICES = (
@@ -156,7 +174,7 @@ def News(stock):
         return []
     articles = []
     for article in news:
-        content = article["content"]
+        content = article.get("content") or {}
         if content.get("contentType") != "STORY":
             continue
         articles.append({

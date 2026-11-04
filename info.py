@@ -11,7 +11,6 @@ GOOGLE_NEWS = (
 HEADERS = {
     "User-Agent": "Company Analyzer (abhijith48070@gmail.com)",
     "Accept-Encoding": "gzip, deflate",
-    "Host": "data.sec.gov"
 }
 
 
@@ -58,24 +57,6 @@ class CompanyInfo:
         except Exception:
 
             return ""
-    def get_filing_text(self, cik, accession_number, primary_document):
-
-        cik = str(cik).zfill(10)
-
-        accession = accession_number.replace("-", "")
-
-        url = (
-            f"https://www.sec.gov/Archives/edgar/data/"
-            f"{int(cik)}/{accession}/{primary_document}"
-        )
-
-        response = requests.get(url, headers=HEADERS)
-
-        if response.status_code == 200:
-            return response.text
-
-        return ""
-
     # -------------------------
     # SEC API
     # -------------------------
@@ -99,34 +80,23 @@ class CompanyInfo:
 
         return response.json()
 
-    def get_recent_filings(self, cik, limit=10):
+    def get_recent_filings(self, cik, limit=10, forms=("10-K", "10-Q", "8-K", "DEF 14A"), with_text=False):
+        """Filter by form first; fetch text only when asked (lazy)."""
+        recent = self.get_company_submissions(cik)["filings"]["recent"]
+        out = []
+        for i, form in enumerate(recent["form"]):
+            if form not in forms:
+                continue
+            f = {"form": form, "filing_date": recent["filingDate"][i],
+                 "accession_number": recent["accessionNumber"][i],
+                 "primary_document": recent["primaryDocument"][i]}
+            if with_text:
+                f["text"] = self.get_filing_text(cik, f["accession_number"], f["primary_document"])
+            out.append(f)
+            if len(out) >= limit:
+                break
+        return out
 
-        data = self.get_company_submissions(cik)
-
-        recent = data["filings"]["recent"]
-
-        filings = []
-        count=min(limit,len(recent["form"]))
-        for i in range(count):
-            filings.append({
-
-            "form": recent["form"][i],
-
-            "filing_date": recent["filingDate"][i],
-
-            "accession_number": recent["accessionNumber"][i],
-
-            "primary_document": recent["primaryDocument"][i],
-
-            "text": self.get_filing_text(
-                cik,
-                recent["accessionNumber"][i],
-                recent["primaryDocument"][i]
-                )
-
-            })
-
-        return filings
     def get_filing_text(self, cik, accession_number, primary_document):
 
         cik = str(cik).zfill(10)
@@ -139,9 +109,6 @@ class CompanyInfo:
         )
 
         response = requests.get(url, headers=HEADERS)
-
-        print(url)
-        print(response.status_code)
 
         if response.status_code == 200:
             return response.text

@@ -33,8 +33,8 @@ from data import (
 from analysis import (
     dcfcalc,
     rating,
-    riskanalysis,
-    Riskanalysis,
+    altman_z,
+    piotroski_f,
 )
 
 # ============================================================
@@ -260,12 +260,12 @@ def analyze_company(ticker):
         )
 
         altman_future = executor.submit(
-            riskanalysis,
+            altman_z,
             stock
         )
 
         piotroski_future = executor.submit(
-            Riskanalysis,
+            piotroski_f,
             stock
         )
 

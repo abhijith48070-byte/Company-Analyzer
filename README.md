@@ -1,3 +1,5 @@
+> **v3:** see RUN.md for the full command list (valuation, forensics, SEC filings, ML, RAG, tracker, thesis, API, dashboard).
+
 # Company Analyzer
 
 An AI-powered equity research platform that automates company analysis using financial data, valuation models, AI-generated reports, and LangGraph-based workflow orchestration.

@@ -1,0 +1,16 @@
+yfinance
+pandas
+numpy
+scipy
+scikit-learn
+networkx
+requests
+beautifulsoup4
+lxml
+rapidfuzz
+python-dotenv
+google-genai
+fastapi
+uvicorn
+streamlit
+# optional: lightgbm (extra distress model), transformers+torch (FinBERT sentiment; word-list fallback otherwise)

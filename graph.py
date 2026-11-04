@@ -8,11 +8,10 @@ import time
 from langgraph.graph import StateGraph, END
 
 from data import get_company_info, get_financialmetrics, peertickers, News
-from analysis import dcfcalc, riskanalysis, Riskanalysis, rating
+from analysis import dcfcalc, altman_z, piotroski_f, rating
 from utils import client
 
 import time
-from IPython.display import Image
 # ---------------- Shared State ----------------
 
 class AnalysisState(TypedDict, total=False):
@@ -59,8 +58,8 @@ def node_industry(state: AnalysisState) -> dict:
 def node_risk(state: AnalysisState) -> dict:
     print("Running Risk Analysis...")
     return {
-        "altman": riskanalysis(state["stock"]),
-        "piotroski": Riskanalysis(state["stock"]),
+        "altman": altman_z(state["stock"]),
+        "piotroski": piotroski_f(state["stock"]),
     }
 
 

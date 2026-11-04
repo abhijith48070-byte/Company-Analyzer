@@ -3,3 +3,14 @@ __pycache__/
 *.pyc
 .DS_Store
 
+.env
+.venv/
+data/
+results/
+judge_cache.jsonl
+labelsheet.csv
+cache/
+reports/
+tracker.db
+private_companies.json
+__pycache__/
