@@ -5,7 +5,12 @@ import os
 import re
 import time
 
+import warnings
+
 import requests
+from bs4 import XMLParsedAsHTMLWarning
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)  # inline-XBRL filings start with an XML header; HTML parsing is fine
 
 UA = os.getenv("SEC_USER_AGENT", "CompanyAnalyzer research (set-SEC_USER_AGENT@example.com)")
 _last = [0.0]
@@ -164,3 +169,79 @@ def parse_form4(xml):
         tx.append({"date": g("transactionDate"), "code": g("transactionCode"), "shares": g("transactionShares"),
                    "price": g("transactionPricePerShare"), "acq_disp": g("transactionAcquiredDisposedCode")})
     return {"insider": owner.text if owner else None, "transactions": tx}
+
+
+# ------------------------------------------------ multi-year history (XBRL)
+XBRL_MAP = {
+    "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax"],
+    "cogs": ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"],
+    "gross_profit": ["GrossProfit"],
+    "sga": ["SellingGeneralAndAdministrativeExpense"],
+    "depreciation": ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization", "Depreciation"],
+    "ebit": ["OperatingIncomeLoss"],
+    "interest_expense": ["InterestExpense", "InterestExpenseNonoperating", "InterestExpenseDebt"],
+    "pretax": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+               "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],
+    "tax": ["IncomeTaxExpenseBenefit"],
+    "net_income": ["NetIncomeLoss", "ProfitLoss"],
+    "receivables": ["AccountsReceivableNetCurrent", "ReceivablesNetCurrent"],
+    "inventory": ["InventoryNet"],
+    "current_assets": ["AssetsCurrent"],
+    "ppe": ["PropertyPlantAndEquipmentNet"],
+    "total_assets": ["Assets"],
+    "current_liabilities": ["LiabilitiesCurrent"],
+    "lt_debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
+    "total_liabilities": ["Liabilities"],
+    "equity": ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    "cash": ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
+    "retained_earnings": ["RetainedEarningsAccumulatedDeficit"],
+    "ocf": ["NetCashProvidedByUsedInOperatingActivities"],
+    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment"],
+}
+_FLOWS = {"revenue", "cogs", "gross_profit", "sga", "depreciation", "ebit", "interest_expense", "pretax", "tax", "net_income", "ocf", "capex"}
+
+
+def _annual(facts, concepts, flow):
+    """{fiscal_end: (value, filed)}. 10-K annual facts only; flows must span ~1 year; for each end the LATEST filing wins (restatements)."""
+    from datetime import date
+    out = {}
+    for c in concepts:
+        try:
+            rows = facts["facts"]["us-gaap"][c]["units"]["USD"]
+        except KeyError:
+            continue
+        for r in rows:
+            if r.get("form") not in ("10-K", "10-K/A") or r.get("fp") != "FY":
+                continue
+            if flow:
+                try:
+                    d = (date.fromisoformat(r["end"]) - date.fromisoformat(r["start"])).days
+                except Exception:
+                    continue
+                if not 330 <= d <= 380:
+                    continue
+            if r["end"] not in out or r.get("filed", "") > out[r["end"]][1]:
+                out[r["end"]] = (float(r["val"]), r.get("filed", ""))
+        if out:
+            break                        # first concept that has data wins (avoids mixing definitions)
+    return out
+
+
+def periods_from_xbrl(facts, years=12):
+    """SEC companyfacts -> list of period dicts (same fields as fin_model.normalize, newest first) with a 'filed' date for point-in-time use.
+    Gives up to ~10+ fiscal years instead of Yahoo's 4. Missing items are 0 (as with the Yahoo path); a period needs assets, revenue."""
+    series = {k: _annual(facts, v, k in _FLOWS) for k, v in XBRL_MAP.items()}
+    ends = sorted(set(series["total_assets"]) & set(series["revenue"]), reverse=True)[:years]
+    out = []
+    for e in ends:
+        row = {"date": e, "filed": max((series[k][e][1] for k in series if e in series[k]), default="")}
+        for k in XBRL_MAP:
+            row[k] = series[k].get(e, (0.0, ""))[0]
+        row["shares"] = 0.0
+        if not row["gross_profit"] and row["revenue"] and row["cogs"]:
+            row["gross_profit"] = row["revenue"] - row["cogs"]
+        if not row["total_liabilities"] and row["total_assets"]:
+            row["total_liabilities"] = row["total_assets"] - row["equity"]
+        row["total_debt"] = row["lt_debt"]; row["capex"] = abs(row["capex"])
+        out.append(row)
+    return out

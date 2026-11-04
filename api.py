@@ -116,3 +116,45 @@ class Round(BaseModel):
 def private_round(r: Round):
     PRIVATE.add_round(r.name, r.date, r.series, r.amount_usd, r.valuation_usd, r.investors, r.source)
     return PRIVATE.summary(r.name)
+
+
+class PortfolioReq(BaseModel):
+    tickers: List[str]
+    years: int = 3
+    weights: Optional[List[float]] = None
+    rf: float = 0.04
+    max_weight: float = 0.5
+
+
+@app.post("/portfolio")
+def portfolio_ep(req: PortfolioReq):
+    import pandas as pd
+    import portfolio as P
+    import quant_cli_lib as ql
+    px = ql.prices(req.tickers + ["SPY"], req.years); r = px.pct_change().dropna()
+    res = P.analyze_portfolio(r[req.tickers], req.rf, req.weights, pd.DataFrame({"market": r["SPY"]}), req.max_weight)
+    res["walk_forward_oos"] = P.walk_forward_compare(r[req.tickers], max_w=req.max_weight)
+    return _clean(res)
+
+
+class MacroReq(BaseModel):
+    ticker: str
+    industry: str = "auto"
+    shocks: dict = {}
+
+
+@app.post("/macro")
+def macro_ep(req: MacroReq):
+    import macro as M
+    return _clean(M.simulate(data.metrics_for(req.ticker), req.industry, req.shocks))
+
+
+@app.get("/events/{ticker}")
+def events_ep(ticker: str):
+    import yfinance as yf, event_study as ES, pandas as pd
+    t = yf.Ticker(ticker); px = yf.download([ticker, "SPY"], period="10y", auto_adjust=True, progress=False)["Close"].ffill().dropna()
+    r = px.pct_change().dropna(); ed = t.get_earnings_dates(limit=40)
+    ev = [{"date": d.tz_localize(None).normalize(), "category": "earnings", "surprise": None if pd.isna(x.get("Surprise(%)")) else float(x["Surprise(%)"])}
+          for d, x in ed.iterrows() if pd.notna(x.get("Reported EPS"))]
+    df = ES.run_events(r[ticker], r["SPY"], ev)
+    return _clean({"summary": ES.summarize(df), "surprise_validation": ES.surprise_validation(df)})

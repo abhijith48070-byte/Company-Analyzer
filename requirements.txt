@@ -14,3 +14,4 @@ fastapi
 uvicorn
 streamlit
 # optional: lightgbm (extra distress model), transformers+torch (FinBERT sentiment; word-list fallback otherwise)
+# optional: xgboost, shap (extra ML explainability)

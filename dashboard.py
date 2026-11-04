@@ -45,7 +45,7 @@ if not res:
 
 m, v, t = res["metrics"], res.get("valuation") or {}, st.session_state["ticker"]
 tabs = st.tabs(["Overview", "Financials", "Valuation", "Forensics", "Filings", "AI Research", "ML Intelligence",
-                "Competitors", "Corporate Graph", "Transactions", "News", "Investment Thesis"])
+                "Competitors", "Corporate Graph", "Transactions", "News", "Investment Thesis", "Quant Lab"])
 
 with tabs[0]:
     st.subheader(f"{m.get('Name')} ({t})")
@@ -158,3 +158,30 @@ with tabs[10]:
 with tabs[11]:
     if res.get("thesis"):
         st.markdown(th.render_thesis(res["thesis"], m.get("Name") or t))
+
+
+with tabs[12]:
+    import montecarlo, macro as macro_mod
+    mc = res.get("montecarlo") or {}
+    st.subheader("Monte Carlo DCF")
+    if "median" in mc:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("P10", f"${mc['p10']:.2f}"); c2.metric("Median", f"${mc['median']:.2f}"); c3.metric("P90", f"${mc['p90']:.2f}"); c4.metric("P(value > price)", f"{mc['prob_undervalued']:.0%}")
+        st.bar_chart(pd.Series(mc["sensitivity_share"]), height=200); st.caption(mc["note"])
+    else:
+        st.info(mc.get("error", "Monte Carlo unavailable"))
+    st.subheader("Macro shock simulator (illustrative cost shares; edit before trusting)")
+    ind = st.selectbox("Industry template", list(macro_mod.ILLUSTRATIVE))
+    sh = st.slider("Input-cost shock (%)", -30, 50, 15) / 100; bp = st.slider("Rates (bp)", -200, 300, 100); fx = st.slider("FX vs USD (%)", -30, 30, -10) / 100
+    inp = list(macro_mod.ILLUSTRATIVE[ind]["inputs"])[0]
+    st.json(macro_mod.simulate(m, ind, {inp: sh, "rates_bp": bp, "fx": fx}))
+    st.subheader("Portfolio optimiser")
+    tk = st.text_input("Tickers (comma separated)", "AAPL,MSFT,NVDA,JPM")
+    if st.button("Optimise"):
+        import portfolio as P, quant_cli_lib as ql
+        names = [x.strip().upper() for x in tk.split(",") if x.strip()]
+        r = ql.prices(names + ["SPY"], 3).pct_change().dropna()
+        out = P.analyze_portfolio(r[names], 0.04, None, pd.DataFrame({"market": r["SPY"]}), 0.5)
+        st.dataframe(pd.DataFrame({k: v["weights"] for k, v in out["portfolios"].items()}))
+        st.dataframe(pd.DataFrame({k: {x: v[x] for x in ("return", "vol", "sharpe", "var_hist", "cvar_hist", "max_drawdown")} for k, v in out["portfolios"].items()}).T)
+        st.write("Out-of-sample Sharpe:", {k: round(v["oos_sharpe"], 2) for k, v in P.walk_forward_compare(r[names], max_w=0.5).items()}); st.caption(out["caveat"])

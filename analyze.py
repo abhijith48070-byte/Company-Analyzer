@@ -1,6 +1,13 @@
 """Company Analyzer CLI:  python analyze.py NVDA [--peers] [--edgar] [--llm ollama:qwen2.5:7b]
 Prints and saves a markdown research report from computed numbers (no LLM required)."""
-import argparse, json, os, sys
+import argparse, json, os, sys, time, warnings
+
+warnings.filterwarnings("ignore", module="yfinance")
+_T0 = time.time()
+
+
+def log(msg):
+    print(f"[{time.time() - _T0:6.1f}s] {msg}", file=sys.stderr, flush=True)
 
 import data
 from analysis import dcfcalc, altman_z, piotroski_f, rating, get_peer_info
@@ -24,6 +31,7 @@ def money(x):
 
 
 def analyze(ticker, peers=False, edgar=False, max_peers=25, do_ml=False, do_comp=False, do_events=False, questions=(), llm="", do_thesis=False):
+    log(f"fetching {ticker} from Yahoo Finance")
     stock, info = data.get_company_info(ticker)
     m = data.get_financialmetrics(info)
     statements = data.finstatements(stock)
@@ -32,12 +40,19 @@ def analyze(ticker, peers=False, edgar=False, max_peers=25, do_ml=False, do_comp
     import pipeline
     pmap = {}
     if (peers or do_comp or do_ml) and m.get("Sector"):
+        log(f"fetching up to {max_peers} sector peers (slow, ~1-2 min)")
         pmap = pipeline.peer_info_map(ticker, m["Sector"], max_peers)
     if peers and m.get("Sector"):
         pt, peer_infos = list(pmap), list(pmap.values())
         out["industry"] = rating(m, pt, peer_infos)
+    log("valuation (WACC, DCF, reverse DCF, scenarios)")
     out["dcf"] = dcfcalc(m)
     out["valuation"] = valuation_suite(m, peer_infos) if m.get("Fcf") and m.get("Sharesoutstanding") else {}
+    try:
+        import montecarlo
+        out["montecarlo"] = montecarlo.simulate(m)
+    except Exception as e:
+        out["montecarlo"] = {"error": str(e)}
     try:
         periods = normalize(statements)
         out["periods"] = periods
@@ -51,16 +66,20 @@ def analyze(ticker, peers=False, edgar=False, max_peers=25, do_ml=False, do_comp
         except Exception as e:
             out[k] = {"error": str(e)}
     if edgar or questions:
+        log("SEC EDGAR: filings, XBRL facts, 10-K comparison (needs SEC_USER_AGENT)")
         out["filings"] = edgar_section(ticker) if edgar else {}
     tp = out.get("periods") or []
     if do_comp and pmap:
+        log("competitor comparison")
         out["competitors"] = pipeline.run_competitors(ticker, info, pmap, tp)
     if do_ml and m.get("Sector"):
+        log("ML: fetching peer statements (cached for 30 days) and training models (first run is slow)")
         try:
             out["ml"] = pipeline.run_ml(ticker, stock, list(pmap), tp, m["Sector"])
         except Exception as e:
             out["ml"] = {"error": str(e)}
     if do_events:
+        log("news / event timeline")
         try:
             out["events"] = pipeline.run_events(stock, (out.get("filings") or {}).get("recent_filings"))
         except Exception as e:
@@ -69,11 +88,20 @@ def analyze(ticker, peers=False, edgar=False, max_peers=25, do_ml=False, do_comp
         try:
             from rag import make_llm
             cik = data.get_cik(ticker)
-            idx = pipeline.build_rag(ticker, cik, data.News(stock))
+            rels = []
+            try:
+                import guidance
+                rels = guidance.fetch_earnings_releases(cik, 6)
+                out["guidance"] = {"events": guidance.guidance_history(rels)[-6:],
+                                   "latest": guidance.extract_guidance(max(rels, key=lambda r: r["date"])["text"]) if rels else []}
+            except Exception as e:
+                out["guidance"] = {"error": str(e)}
+            idx = pipeline.build_rag(ticker, cik, data.News(stock), periods=out.get("periods"), releases=rels)
             out["rag"] = [{"question": q, **idx.answer(q, llm=make_llm(llm))} for q in questions]
         except Exception as e:
             out["rag"] = [{"question": q, "answer": f"RAG unavailable: {e}", "sources": [], "unsupported_numbers": []} for q in questions]
     if do_thesis:
+        log("building thesis")
         import thesis
         out["thesis"] = thesis.build_thesis(out)
     return out
@@ -99,6 +127,27 @@ def edgar_section(ticker):
     return res
 
 
+def render_guidance(g):
+    if not g:
+        return ""
+    if g.get("error"):
+        return f"\n*Guidance extraction unavailable: {g['error']}*\n"
+    L = ["\n### Management guidance (from SEC earnings releases)\n"]
+    def fmt(metric, v):
+        if metric in ("gross_margin", "operating_margin", "tax_rate"): return f"{v:.1f}%"
+        if metric == "eps": return f"${v:,.2f}"
+        return f"${v / 1e9:,.2f}B" if abs(v) >= 1e9 else (f"${v / 1e6:,.1f}M" if abs(v) >= 1e6 else f"{v:,.2f}")
+    for x in g.get("latest", []):
+        lo, hi = fmt(x["metric"], x["low"]), fmt(x["metric"], x["high"])
+        L.append(f"- Latest {x['metric']}: {lo if lo == hi else lo + ' to ' + hi} - \"{x['sentence'][:160]}\"")
+    if not g.get("latest"):
+        L.append("- No forward-looking numeric guidance found in the latest releases.")
+    for e in g.get("events", []):
+        L.append(f"- {e['date']}: **{e['category']}** (" + ", ".join(f"{c['metric']} {c['direction']} {c['change']:+.1%}" for c in e["changes"]) + ")")
+    L.append("- Heuristic text extraction; verify against the release.\n")
+    return "\n".join(L)
+
+
 def render(r):
     m, L = r["metrics"], []
     a = L.append
@@ -113,7 +162,8 @@ def render(r):
         w = v["wacc"]
         a("## Valuation\n")
         a(f"**WACC {pct(w['wacc'],2)}** (cost of equity {pct(w['cost_of_equity'],2)}, beta {w['beta']:.2f}, "
-          f"risk-free {pct(w['rf'])}, ERP {pct(w['erp'])}, debt weight {pct(w['weight_debt'])})\n")
+          f"risk-free {pct(w['rf'])} [{w.get('rf_source')}], ERP {pct(w['erp'])} [{w.get('erp_source')}], "
+          f"debt weight {pct(w['weight_debt'])})\n")
         sc = v.get("scenarios", {})
         if "error" in sc:
             a(f"**DCF scenarios unavailable:** {sc['error']}\n")
@@ -125,6 +175,18 @@ def render(r):
             fv = v.get("fair_value_range", {})
             a(f"\nFair-value range {money(fv.get('low'))} - {money(fv.get('high'))}; base case margin of safety "
               f"{fv.get('margin_of_safety_base_pct', float('nan')):+.1f}% vs price {money(m.get('Currentprice'))}.\n")
+        mc = r.get("montecarlo") or {}
+        if "p50" in mc or "median" in mc:
+            a("### Monte Carlo DCF (20,000 correlated draws)\n")
+            a(f"- 10th / median / 90th percentile value per share: **{money(mc['p10'])} / {money(mc['median'])} / {money(mc['p90'])}** vs price {money(mc['price'])}")
+            a(f"- Probability value > price: {pct(mc['prob_undervalued'])}; <= price: {pct(mc['prob_overvalued'])}")
+            a("- Share of valuation uncertainty by driver: " + ", ".join(f"{k} {pct(x)}" for k, x in mc["sensitivity_share"].items()))
+            if mc.get("price_outside_range"):
+                a(f"- **Warning:** the market price is outside the simulated 1st-99th percentile range ({money(mc['p01'])} to {money(mc['p99'])}). "
+                  "The simulation inherits the model's growth cap and starting FCF, so for hypergrowth or depressed-FCF companies read this as 'the model cannot reach the price', not as a probability of overvaluation.")
+            a(f"- {mc['note']}\n")
+        elif mc.get("error"):
+            a(f"*Monte Carlo DCF unavailable: {mc['error']}*\n")
         rd = v.get("reverse_dcf", {})
         if "error" not in rd:
             a("### What the market price implies (reverse DCF)\n")
@@ -196,6 +258,7 @@ def render(r):
         for g in fl.get("governance_flags", []):
             a(f"- Governance flag **{g['flag']}**: ...{g['context'][:250]}...")
     a(__import__("pipeline").render_extras(r))
+    a(render_guidance(r.get("guidance")))
     a("\n*Educational research output; not investment advice. Model-generated figures depend on Yahoo Finance data and stated assumptions.*")
     return "\n".join(L)
 
@@ -235,6 +298,7 @@ if __name__ == "__main__":
     res = analyze(t, a.peers, a.edgar, a.max_peers, a.ml, a.competitors, a.events, a.ask, a.llm, a.thesis)
     md = render(res)
     if a.llm:
+        log(f"writing AI assessment with {a.llm} (can take several minutes on a laptop CPU)")
         md += "\n\n## AI assessment (model-generated interpretation)\n\n" + narrative(md, a.llm)
     os.makedirs("reports", exist_ok=True)
     open(f"reports/{t}.md", "w").write(md)
@@ -242,5 +306,6 @@ if __name__ == "__main__":
     if res.get("thesis"):
         import thesis
         open(f"reports/{t}_thesis.md", "w").write(thesis.render_thesis(res["thesis"], res["metrics"].get("Name") or t))
+    log("done")
     print(md)
     print(f"\nSaved reports/{t}.md and reports/{t}.json")
